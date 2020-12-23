@@ -1,0 +1,300 @@
+import os
+from glob import glob
+import numpy as np
+import pandas as pd
+import h5py
+import random
+import _pickle as pickle
+from config import *
+from visual_utils import plot_middle_slices_comparison
+
+def get_meta_dict():
+    '''
+    将所有单个元数据文件转化为一个总的元数据文件
+    并返回总的元数据
+    '''
+    cache_file = '{}/all_meta_cache.meta'.format(PREPROCESS_PATH)
+    if os.path.exists(cache_file):
+        print('get meta_dict from cache')
+        with open(cache_file, 'rb') as f:
+            return pickle.load(f)
+
+    meta_dict = {}
+    for f in glob('{}/*.meta'.format(PREPROCESS_PATH)):
+        seriesuid = f[-15:-5]
+        if not os.path.exists('{}/{}.h5'.format(PREPROCESS_PATH, seriesuid)):
+            continue
+
+        with open(f, 'rb') as f:
+            meta = pickle.load(f)
+            meta_dict[meta['seriesuid']] = meta
+
+    # cache it
+    with open(cache_file, 'wb') as f:
+        pickle.dump(meta_dict, f)
+
+    return meta_dict
+
+def get_tumor_records():
+    '''
+    annotations.csv文件中，追加元数据
+    '''
+    numpy_files = glob('{}/*.h5'.format(PREPROCESS_PATH))
+    meta_dict = get_meta_dict()
+
+    fields = ['img_numpy_file', 'origin', 'spacing', 'shape', 'pixels', 'cover_ratio', 'process_duration']
+    def fill_info(seriesuid):
+        data = [None] * len(fields)
+
+        for f in numpy_files:
+            if f[-13:-3] == seriesuid:
+                data[0] = f
+
+        if seriesuid in meta_dict:
+            t = meta_dict[seriesuid]
+            data[1:] = [t['origin'], t['spacing'], t['shape'], t['pixels'], t['cover_ratio'], t['process_duration']]
+
+        return pd.Series(data, index=fields)
+
+    records = pd.read_csv('{}/annotations.csv'.format(ANNOTATIONS_PATH))
+#     print('records[seriesuid]',records['seriesuid'])
+    print(len(records['seriesuid']))
+    for i in range(len(records['seriesuid'])):
+        records['seriesuid'][i]=records['seriesuid'][i][-10:]
+    print('records[seriesuid]',records['seriesuid'])
+    
+    records[fields] = records['seriesuid'].apply(fill_info)
+    records.dropna(inplace=True)
+
+    print('tumor record size {}'.format(records.shape))
+    if DEBUG_ONLY_TRAIN_FINE_CUT_BIG_TUMOR_SWITCHER:
+        records.drop(records[records.cover_ratio < DEBUG_ONLY_TRAIN_COVER_RATIO_BIGGER_THAN].index, axis=0, inplace=True)
+        records.drop(records[records.diameter_mm < DEBUG_ONLY_TRAIN_TUMOR_DIAMETER_LARGER_THAN].index, axis=0, inplace=True)
+        print('after drop, tumor record size {}'.format(records.shape))
+
+    return records
+
+tumor_records = get_tumor_records()
+tumor_records_len = tumor_records.shape[0]
+if tumor_records_len == 0:
+    print('no tumor records, generator cannot work')
+    exit()
+
+if RANDOMIZE_RECORDS:
+    tumor_records = tumor_records.iloc[np.random.permutation(tumor_records_len)]
+    print('tumor_records_train randomized')
+
+tumor_records_train = tumor_records[:int(tumor_records_len * TRAIN_VAL_RATIO)]
+tumor_records_val = tumor_records[int(tumor_records_len * TRAIN_VAL_RATIO):]
+del tumor_records, tumor_records_len
+
+'''
+重新采样
+将某一类的直径的样本数乘以设置的比率
+'''
+re_sample = (TRAIN_CLASSIFY_NOT_SEGMENTATION and TRAIN_CLASSIFY_ENABLE_DATA_AUGUMENTATION) \
+            or ((not TRAIN_CLASSIFY_NOT_SEGMENTATION) and TRAIN_SEG_ENABLE_DATA_AUGUMENTATION)
+if re_sample:
+    r_10 = tumor_records_train[tumor_records_train.diameter_mm < 10.0]
+    r_30 = tumor_records_train[(tumor_records_train.diameter_mm >= 10.0) & (tumor_records_train.diameter_mm < 30.0)]
+    r_more = tumor_records_train[tumor_records_train.diameter_mm >= 30.0]
+
+
+    concats = []
+    for _ in range(RESAMPLE_DATA_LESS_10_RATIO):
+        concats.append(r_10)
+    for _ in range(RESAMPLE_DATA_LESS_30_RATIO):
+        concats.append(r_30)
+    concats.append(r_more)
+    tumor_records_train = pd.concat(concats, axis=0)
+
+    print('after resample, got {} samples'.format(tumor_records_train.shape[0]))
+
+# random_offset works iff around_tumor=True
+def get_block(record, around_tumor=True, random_offset=(0, 0, 0), shape=(INPUT_WIDTH, INPUT_HEIGHT, INPUT_DEPTH)):
+    with h5py.File(record['img_numpy_file'], 'r') as hf:
+        W, H, D = hf['img'].shape[0], hf['img'].shape[1], hf['img'].shape[2]
+        '''
+        around_tumor=True 在肺结节附近截取块
+        '''
+        if around_tumor:
+            coord = np.array([record['coordX'], record['coordY'], record['coordZ']])
+            '''
+            w,h,d 为block的起始坐标
+            肺结节坐标标准化
+            肺结节坐标加上随机偏移
+            以肺结节坐标为中心，block的宽高深为尺度，计算起始坐标
+            起始坐标小于0，则置为0
+            起始坐标与图像裁掉block的最大坐标比，取最小值
+            '''
+            coord = np.abs((coord - record['origin']) / record['spacing'])
+            coord = coord + random_offset                  
+            w, h, d = int(coord[0] - shape[0] // 2), int(coord[1] - shape[1] // 2), int(coord[2] - shape[2] // 2)
+            w, h, d = max(w, 0), max(h, 0), max(d, 0)
+            w, h, d = min(w, W - shape[0] - 1), min(h, H - shape[1] - 1), min(d, D - shape[2] - 1)
+        else:
+            w, h, d = random.randint(0, W - shape[0] - 1), random.randint(0, H - shape[1] - 1), random.randint(0, D - shape[2] - 1)
+
+        block = hf['img'][w:w + shape[0], h:h + shape[1], d:d + shape[2]]
+        '''
+        将块中像素为0的值置为当前img的像素最小值
+        '''
+        block[block==0] = np.min(hf['img'])
+        '''
+        块中像素值归一化
+        '''
+        block = (block - MIN_BOUND) / (MAX_BOUND - MIN_BOUND)
+        '''
+        块中像素值clip在(0,1)
+        '''
+        block = np.clip(block, 0.0, 1.0)
+
+        # DenseNet paper suggests to (img-mean)/std, use this for simple
+        '''
+        采用DenseNet模型，块中像素值标准化
+        '''
+        if TRAIN_CLASSIFY_NOT_SEGMENTATION and TRAIN_CLASSIFY_MODEL.lower() == 'densenet':
+            block = block - 0.5
+
+        return block
+
+def plot_batch_sample(X, y=None):
+    assert X.shape[0] == y.shape[0]
+
+    for b in range(X.shape[0]):
+        plot_middle_slices_comparison([X[b, :, :, :, 0], y[b, :, :, :, 0]])
+
+def get_seg_batch(batch_size=32, from_train=True, random_choice=False):
+    idx = 0
+    records = tumor_records_train if from_train else tumor_records_val
+
+    X = np.zeros((batch_size, INPUT_WIDTH, INPUT_HEIGHT, INPUT_DEPTH, INPUT_CHANNEL))
+    y = np.zeros((batch_size, INPUT_WIDTH, INPUT_HEIGHT, INPUT_DEPTH, OUTPUT_CHANNEL))
+
+    while True:
+        for b in range(batch_size):
+            if random_choice:
+                idx = random.randint(0, records.shape[0] - 1)
+
+            record = records.iloc[idx]
+            '''
+            图像分割
+            此block是否包含肺结节
+            '''
+            is_positive_sample = random.random() < TRAIN_SEG_POSITIVE_SAMPLE_RATIO
+            random_offset = np.array([0, 0, 0])
+            '''
+            数据增强
+            '''
+            if TRAIN_SEG_ENABLE_DATA_AUGUMENTATION:
+                random_offset = np.array([
+                    random.randrange(-TRAIN_SEG_SAMPLE_RANDOM_OFFSET, TRAIN_SEG_SAMPLE_RANDOM_OFFSET),
+                    random.randrange(-TRAIN_SEG_SAMPLE_RANDOM_OFFSET, TRAIN_SEG_SAMPLE_RANDOM_OFFSET),
+                    random.randrange(-TRAIN_SEG_SAMPLE_RANDOM_OFFSET, TRAIN_SEG_SAMPLE_RANDOM_OFFSET)
+                ])
+
+            X[b,:,:,:,0] = get_block(record, around_tumor=is_positive_sample, random_offset=random_offset,
+                                     shape=(INPUT_WIDTH, INPUT_HEIGHT, INPUT_DEPTH))
+            y[b,:,:,:,0] = make_seg_mask(record, create_mask=is_positive_sample, random_offset=random_offset)
+
+            idx = idx + 1 if idx < records.shape[0] - 1 else 0
+
+        # rotate
+        '''
+        肺结节数据增强 宽高深 3个维度进行转置
+        '''
+        if TRAIN_SEG_ENABLE_DATA_AUGUMENTATION:
+            for b in range(batch_size):
+                '''
+                np.random.permutation(x)
+                Randomly permute a sequence, or return a permuted range.
+                If x is a multi-dimensional array, it is only shuffled along its first index.
+                Parameters:    
+                x : int or array_like
+                If x is an integer, randomly permute np.arange(x). If x is an array, make a copy and shuffle the elements randomly.
+                '''
+                _perm = np.random.permutation(3)
+                X[b, :, :, :, 0] = np.transpose(X[b, :, :, :, 0], _perm)
+                y[b, :, :, :, 0] = np.transpose(y[b, :, :, :, 0], _perm)
+
+        if DEBUG_PLOT_WHEN_GETTING_SEG_BATCH:
+            plot_batch_sample(X, y)
+
+        yield X, y
+
+def make_seg_mask(record, create_mask=True, random_offset=(0, 0, 0)):
+    '''
+    分割掩码
+    '''
+    mask = np.zeros((INPUT_WIDTH, INPUT_HEIGHT, INPUT_DEPTH))
+
+    if create_mask:
+        '''
+        肺结节半径
+        '''
+        r = record['diameter_mm'] / 2  + DIAMETER_BUFFER
+        radius = np.array([r, r, r])
+        '''
+        spacing：图像各维度上像素之间的距离（物理层面的，有单位，一般为mm)
+        '''
+        if DIAMETER_SPACING_EXPAND:
+            radius = radius / record['spacing']
+        '''
+        coord 肺结节中心坐标
+        random_offset 坐标偏移量
+        radius 肺结节半径
+        '''
+        coord = np.array([INPUT_WIDTH / 2, INPUT_HEIGHT / 2, INPUT_DEPTH / 2])
+        coord = coord - random_offset
+        radius, coord = radius.astype(np.uint16), coord.astype(np.uint16)
+
+        mask[coord[0] - radius[0]:coord[0] + radius[0] + 1,
+             coord[1] - radius[1]:coord[1] + radius[1] + 1,
+             coord[2] - radius[2]:coord[2] + radius[2] + 1] = 1.0
+
+    return mask
+
+def get_classify_batch(batch_size=32, from_train=True, random_choice=False):
+    idx = 0
+    records = tumor_records_train if from_train else tumor_records_val
+
+    shape = (CLASSIFY_INPUT_WIDTH, CLASSIFY_INPUT_HEIGHT, CLASSIFY_INPUT_DEPTH)
+    '''正样本数，即在肺结节坐标处截取block'''
+    positive_num = int(batch_size * TRAIN_CLASSIFY_POSITIVE_SAMPLE_RATIO)
+    X = np.zeros((batch_size, CLASSIFY_INPUT_WIDTH, CLASSIFY_INPUT_HEIGHT, CLASSIFY_INPUT_DEPTH, CLASSIFY_INPUT_CHANNEL))
+    y = np.zeros((batch_size, 2))
+
+    while True:
+        for b in range(positive_num):
+            '''随机读取'''
+            if random_choice:
+                idx = random.randint(0, records.shape[0] - 1)
+            record = records.iloc[idx]
+            random_offset = np.array([0, 0, 0])
+            '''
+            数据增强
+            '''
+            if TRAIN_CLASSIFY_ENABLE_DATA_AUGUMENTATION:
+                random_offset = np.array([
+                    random.randrange(-TRAIN_CLASSIFY_SAMPLE_RANDOM_OFFSET, TRAIN_CLASSIFY_SAMPLE_RANDOM_OFFSET),
+                    random.randrange(-TRAIN_CLASSIFY_SAMPLE_RANDOM_OFFSET, TRAIN_CLASSIFY_SAMPLE_RANDOM_OFFSET),
+                    random.randrange(-TRAIN_CLASSIFY_SAMPLE_RANDOM_OFFSET, TRAIN_CLASSIFY_SAMPLE_RANDOM_OFFSET)
+                ])
+
+            X[b, :, :, :, 0] = get_block(record, around_tumor=True, random_offset=random_offset, shape=shape)
+            y[b, 0] = 1
+
+            idx = idx + 1 if idx < records.shape[0] - 1 else 0
+        '''负样本  即没有包含肺结节的block'''
+        for b in range(positive_num, batch_size):
+            record = records.iloc[random.randint(0, records.shape[0] - 1)]
+            X[b, :, :, :, 0] = get_block(record, around_tumor=False, shape=shape)
+            y[b, 1] = 1
+
+        # rotate
+        '''数据增强 block 的宽高深 3个维度进行转置'''
+        if TRAIN_CLASSIFY_ENABLE_DATA_AUGUMENTATION:
+            for b in range(batch_size):
+                X[b, :, :, :, 0] = np.transpose(X[b, :, :, :, 0], np.random.permutation(3))
+
+        yield X, y
